@@ -1,3 +1,4 @@
+#include <float.h>
 #include "postgres.h"
 
 #include "access/relscan.h"
@@ -7,36 +8,33 @@
 #include "storage/lmgr.h"
 #include "utils/memutils.h"
 
-/*
- * Algorithm 5 from paper
- */
 static List *
 GetScanItems(IndexScanDesc scan, Datum q)
 {
-	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
-	Relation	index = scan->indexRelation;
-	FmgrInfo   *procinfo = so->procinfo;
-	Oid			collation = so->collation;
-	List	   *ep;
-	List	   *w;
-	int			m;
-	HnswElement entryPoint;
+       HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+       Relation        index = scan->indexRelation;
+       FmgrInfo   *procinfo = so->procinfo;
+       Oid                     collation = so->collation;
+       List       *ep;
+       List       *w;
+       int                     m;
+       HnswElement entryPoint;
 
-	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
+       /* Get m and entry point */
+       HnswGetMetaPageInfo(index, &m, &entryPoint);
 
-	if (entryPoint == NULL)
-		return NIL;
+       if (entryPoint == NULL)
+               return NIL;
 
-	ep = list_make1(HnswEntryCandidate(entryPoint, q, index, procinfo, collation, false));
+       ep = list_make1(HnswEntryCandidate(entryPoint, q, index, procinfo, collation, false));
 
-	for (int lc = entryPoint->level; lc >= 1; lc--)
-	{
-		w = HnswSearchLayer(q, ep, 1, lc, index, procinfo, collation, m, false, NULL);
-		ep = w;
-	}
+       for (int lc = entryPoint->level; lc >= 1; lc--)
+       {
+               w = HnswSearchLayer(q, ep, 1, lc, index, procinfo, collation, m, false, NULL);
+               ep = w;
+       }
 
-	return HnswSearchLayer(q, ep, hnsw_ef_search, 0, index, procinfo, collation, m, false, NULL);
+       return HnswSearchLayer(q, ep, hnsw_ef_search, 0, index, procinfo, collation, m, false, NULL);
 }
 
 /*
@@ -142,6 +140,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+	HnswCandidate *hc;
 
 	/*
 	 * Index can be used to scan backward, but Postgres doesn't support
@@ -168,29 +167,50 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		/* Get scan value */
 		value = GetScanValue(scan);
 
-		/*
-		 * Get a shared lock. This allows vacuum to ensure no in-flight scans
-		 * before marking tuples as deleted.
-		 */
-		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+		if (hnsw_enable_iterator)
+			HnswInitScan(scan, value);
+		else
+			so->w = GetScanItems(scan, value);
 
-		so->w = GetScanItems(scan, value);
-
-		/* Release shared lock */
-		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
-
+		so->last_distance = 0;
 		so->first = false;
 	}
 
-	while (list_length(so->w) > 0)
+	while (hnsw_enable_iterator || list_length(so->w) > 0)
 	{
-		HnswCandidate *hc = llast(so->w);
 		ItemPointer heaptid;
 
+		if (hnsw_enable_iterator)
+		{
+			hc = so->hc;
+			if (hc == NULL)
+			{
+				do
+				{
+					hc = HnswGetNext(scan);
+					if (hc == NULL)
+						break;
+				}
+				while (hnsw_strict_order && hc->distance < so->last_distance);
+
+				if (hc == NULL)
+					break;
+
+				so->last_distance = hc->distance;
+				so->hc = hc;
+			}
+		}
+		else
+		{
+			hc = llast(so->w);
+		}
 		/* Move to next element if no valid heap TIDs */
 		if (list_length(hc->element->heaptids) == 0)
 		{
-			so->w = list_delete_last(so->w);
+			if (hnsw_enable_iterator)
+				so->hc = NULL;
+			else
+				so->w = list_delete_last(so->w);
 			continue;
 		}
 
