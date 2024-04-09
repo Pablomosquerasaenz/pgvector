@@ -12,10 +12,18 @@
 #include <intrin.h>
 #endif
 
+#if (defined(__GNUC__) && (__GNUC__ >= 12)) || \
+	(defined(__clang__) && (__clang_major__ >= 14)) || \
+	(defined __AVX512FP16__)
+#define HAVE_AVX512FP16
+#endif
+
 #ifdef _MSC_VER
 #define TARGET_F16C
+#define TARGET_AVX512
 #else
 #define TARGET_F16C __attribute__((target("avx,f16c,fma")))
+#define TARGET_AVX512 __attribute__((target("avx512fp16,avx512f,avx512vl")))
 #endif
 #endif
 
@@ -74,6 +82,38 @@ HalfvecL2SquaredDistanceF16c(int dim, half * ax, half * bx)
 
 	return distance;
 }
+
+#ifdef HAVE_AVX512FP16
+TARGET_AVX512 static float
+HalfvecL2SquaredDistanceAvx512Fp16(int dim, half * ax, half * bx)
+{
+	float		distance;
+	int			i;
+	int			count = (dim / 16) * 16;
+	__m512 		dist = _mm512_setzero_ps();
+
+	for (i = 0; i < count; i += 16)
+	{
+		__m256h axi = _mm256_loadu_ph(ax+i);
+		__m256h bxi = _mm256_loadu_ph(bx+i);
+		__m512 axs = _mm512_cvtxph_ps(axi);
+		__m512 bxs = _mm512_cvtxph_ps(bxi);
+		__m512 diff = _mm512_sub_ps(axs, bxs);
+		dist = _mm512_fmadd_ps(diff, diff, dist);
+	}
+
+	distance = (float)_mm512_reduce_add_ps(dist);
+
+	for (; i < dim; i++)
+	{
+		float       diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+		distance += diff * diff;
+	}
+
+	return distance;
+}
+#endif
 #endif
 
 static float
@@ -117,6 +157,33 @@ HalfvecInnerProductF16c(int dim, half * ax, half * bx)
 
 	return distance;
 }
+
+#ifdef HAVE_AVX512FP16
+TARGET_AVX512 static float
+HalfvecInnerProductAvx512Fp16(int dim, half * ax, half * bx)
+{
+	float		distance;
+	int			i;
+	int			count = (dim / 16) * 16;
+	__m512		dist = _mm512_setzero_ps();
+
+	for (i = 0; i < count; i += 16)
+	{
+		__m256h axi = _mm256_loadu_ph(ax+i);
+		__m256h bxi = _mm256_loadu_ph(bx+i);
+		__m512 axs = _mm512_cvtxph_ps(axi);
+		__m512 bxs = _mm512_cvtxph_ps(bxi);
+		dist = _mm512_fmadd_ps(axs, bxs, dist);
+	}
+
+	distance = (float)_mm512_reduce_add_ps(dist);
+
+	for (; i < dim; i++)
+		distance += HalfToFloat4(ax[i]) * HalfToFloat4(bx[i]);
+
+	return distance;
+}
+#endif
 #endif
 
 static double
@@ -190,6 +257,50 @@ HalfvecCosineSimilarityF16c(int dim, half * ax, half * bx)
 	/* Use sqrt(a * b) over sqrt(a) * sqrt(b) */
 	return (double) similarity / sqrt((double) norma * (double) normb);
 }
+
+#ifdef HAVE_AVX512FP16
+TARGET_AVX512 static double
+HalfvecCosineSimilarityAvx512Fp16(int dim, half * ax, half * bx)
+{
+	float		similarity;
+	float		norma;
+	float		normb;
+	int			i;
+	int			count = (dim / 16) * 16;
+	__m512		sim = _mm512_setzero_ps();
+	__m512		na = _mm512_setzero_ps();
+	__m512		nb = _mm512_setzero_ps();
+
+	for (i = 0; i < count; i += 16)
+	{
+		__m256h axi = _mm256_loadu_ph(ax+i);
+		__m256h bxi = _mm256_loadu_ph(bx+i);
+		__m512 axs = _mm512_cvtxph_ps(axi);
+		__m512 bxs = _mm512_cvtxph_ps(bxi);
+		sim = _mm512_fmadd_ps(axs, bxs, sim);
+		na = _mm512_fmadd_ps(axs, axs, na);
+		nb = _mm512_fmadd_ps(bxs, bxs, nb);
+	}
+
+	similarity = (float)_mm512_reduce_add_ps(sim);
+	norma = (float)_mm512_reduce_add_ps(na);
+	normb = (float)_mm512_reduce_add_ps(nb);
+
+	/* Auto-vectorized */
+	for (; i < dim; i++)
+	{
+		float		axi = HalfToFloat4(ax[i]);
+		float		bxi = HalfToFloat4(bx[i]);
+
+		similarity += axi * bxi;
+		norma += axi * axi;
+		normb += bxi * bxi;
+	}
+
+	/* Use sqrt(a * b) over sqrt(a) * sqrt(b) */
+	return (double) similarity / sqrt((double) norma * (double) normb);
+}
+#endif
 #endif
 
 static float
@@ -235,6 +346,33 @@ HalfvecL1DistanceF16c(int dim, half * ax, half * bx)
 
 	return distance;
 }
+
+#ifdef HAVE_AVX512FP16
+TARGET_AVX512 static float
+HalfvecL1DistanceAvx512Fp16(int dim, half * ax, half * bx)
+{
+	float		distance;
+	int			i;
+	int			count = (dim / 16) * 16;
+	__m512		dist = _mm512_setzero_ps();
+
+	for (i = 0; i < count; i += 16)
+	{
+		__m256h axi = _mm256_loadu_ph(ax+i);
+		__m256h bxi = _mm256_loadu_ph(bx+i);
+		__m512 axs = _mm512_cvtxph_ps(axi);
+		__m512 bxs = _mm512_cvtxph_ps(bxi);
+		dist = _mm512_add_ps(dist, _mm512_abs_ps(_mm512_sub_ps(axs, bxs)));
+	}
+
+	distance = (float)_mm512_reduce_add_ps(dist);
+
+	for (; i < dim; i++)
+		distance += fabsf(HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]));
+
+	return distance;
+}
+#endif
 #endif
 
 #ifdef HALFVEC_DISPATCH
@@ -271,6 +409,56 @@ SupportsCpuFeature(unsigned int feature)
 	/* Now check features */
 	return (exx[2] & feature) == feature;
 }
+
+#ifdef HAVE_AVX512FP16
+TARGET_XSAVE static bool
+SupportsOsXsave()
+{
+	unsigned int exx[4] = {0, 0, 0, 0};
+
+#if defined(HAVE__GET_CPUID)
+	__get_cpuid(1, &exx[0], &exx[1], &exx[2], &exx[3]);
+#else
+	__cpuid(exx, 1);
+#endif
+
+	return (exx[2] & CPU_FEATURE_OSXSAVE) == CPU_FEATURE_OSXSAVE;
+}
+
+#define CPU_FEATURE_AVX512F         (1 << 16)
+#define CPU_FEATURE_AVX512_FP16     (1 << 23)
+#define CPU_FEATURE_AVX512VL     	(1 << 31)
+
+TARGET_XSAVE static bool
+SupportsAvx512Fp16()
+{
+	unsigned int exx[4] = {0, 0, 0, 0};
+
+	/* Check OS supports XSAVE */
+	if (!SupportsOsXsave())
+		return false;
+
+	/* Check XMM, YMM, and ZMM registers are enabled */
+	if ((_xgetbv(0) & 0xe6) != 0xe6)
+		return false;
+		
+#if defined(HAVE__GET_CPUID)
+	__get_cpuid_count(7, 0, &exx[0], &exx[1], &exx[2], &exx[3]);
+#elif defined(HAVE__CPUID)
+	__cpuid(exx, 7, 0);
+#endif
+
+	/* Required by AVX512 sub/fma/add instructions */
+	if ((exx[1] & CPU_FEATURE_AVX512F) != CPU_FEATURE_AVX512F)
+		return false;
+
+	/* Required by _mm256_loadu_ph */
+    if ((exx[1] & CPU_FEATURE_AVX512VL) != CPU_FEATURE_AVX512VL)
+		return false;
+
+	return (exx[3] & CPU_FEATURE_AVX512_FP16) == CPU_FEATURE_AVX512_FP16;
+}
+#endif
 #endif
 
 void
@@ -294,5 +482,15 @@ HalfvecInit(void)
 		/* Does not require FMA, but keep logic simple */
 		HalfvecL1Distance = HalfvecL1DistanceF16c;
 	}
+
+#ifdef HAVE_AVX512FP16
+    if (SupportsAvx512Fp16())
+	{
+		HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceAvx512Fp16;
+		HalfvecInnerProduct = HalfvecInnerProductAvx512Fp16;
+		HalfvecCosineSimilarity = HalfvecCosineSimilarityAvx512Fp16;
+		HalfvecL1Distance = HalfvecL1DistanceAvx512Fp16;
+	}
+#endif
 #endif
 }
