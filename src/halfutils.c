@@ -2,6 +2,7 @@
 
 #include "halfutils.h"
 #include "halfvec.h"
+#include "utils/guc.h"
 
 #ifdef HALFVEC_DISPATCH
 #include <immintrin.h>
@@ -21,11 +22,15 @@
 #ifdef _MSC_VER
 #define TARGET_F16C
 #define TARGET_AVX512
+#define TARGET_AVX512FP16
 #else
 #define TARGET_F16C __attribute__((target("avx,f16c,fma")))
 #define TARGET_AVX512 __attribute__((target("avx512fp16,avx512f,avx512vl,avx512bw")))
+#define TARGET_AVX512FP16 __attribute__((target("avx512fp16")))
 #endif
 #endif
+
+bool halfvec_use_fp16_compute;
 
 float		(*HalfvecL2SquaredDistance) (int dim, half * ax, half * bx);
 float		(*HalfvecInnerProduct) (int dim, half * ax, half * bx);
@@ -84,8 +89,41 @@ HalfvecL2SquaredDistanceF16c(int dim, half * ax, half * bx)
 }
 
 #ifdef HAVE_AVX512FP16
-TARGET_AVX512 static float
+TARGET_AVX512FP16 static float
 HalfvecL2SquaredDistanceAvx512Fp16(int dim, half * ax, half * bx)
+{
+	float		distance;
+	int			i;
+	int			count = (dim / 32) * 32;
+	unsigned long mask;
+	__m512h 	axi = _mm512_setzero_ph();
+	__m512h 	bxi = _mm512_setzero_ph();
+	__m512h 	diff;
+	__m512h		dist = _mm512_setzero_ph();
+
+	for (i = 0; i < count; i += 32)
+	{
+		axi = _mm512_loadu_ph(ax+i);
+		bxi = _mm512_loadu_ph(bx+i);
+		diff = _mm512_sub_ph(axi, bxi);
+		dist = _mm512_fmadd_ph(diff, diff, dist);
+	}
+
+	mask = (1 << (dim - i)) - 1;
+	axi = _mm512_setzero_ph();
+	bxi = _mm512_setzero_ph();
+	axi = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, ax + i));
+	bxi = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, bx + i));
+	diff = _mm512_sub_ph(axi, bxi);
+	dist = _mm512_fmadd_ph(diff, diff, dist);
+
+	distance = (float)_mm512_reduce_add_ph(dist);
+
+	return distance;
+}
+
+TARGET_AVX512 static float
+HalfvecL2SquaredDistanceAvx512Fp32(int dim, half * ax, half * bx)
 {
 	float		distance;
 	int			i;
@@ -121,6 +159,15 @@ HalfvecL2SquaredDistanceAvx512Fp16(int dim, half * ax, half * bx)
 	distance = (float)_mm512_reduce_add_ps(dist);
 
 	return distance;
+}
+
+static float
+HalfvecL2SquaredDistanceAvx512(int dim, half * ax, half * bx)
+{
+	if (halfvec_use_fp16_compute)
+		return HalfvecL2SquaredDistanceAvx512Fp16(dim, ax, bx);
+	else
+		return HalfvecL2SquaredDistanceAvx512Fp32(dim, ax, bx);
 }
 #endif
 #endif
@@ -168,8 +215,38 @@ HalfvecInnerProductF16c(int dim, half * ax, half * bx)
 }
 
 #ifdef HAVE_AVX512FP16
-TARGET_AVX512 static float
+TARGET_AVX512FP16 static float
 HalfvecInnerProductAvx512Fp16(int dim, half * ax, half * bx)
+{
+	float		distance;
+	int			i;
+	int			count = (dim / 32) * 32;
+	unsigned long mask;
+	__m512h 	axi = _mm512_setzero_ph();
+	__m512h 	bxi = _mm512_setzero_ph();
+	__m512h		dist = _mm512_setzero_ph();
+
+	for (i = 0; i < count; i += 32)
+	{
+		axi = _mm512_loadu_ph(ax+i);
+		bxi = _mm512_loadu_ph(bx+i);
+		dist = _mm512_fmadd_ph(axi, bxi, dist);
+	}
+
+	mask = (1 << (dim - i)) - 1;
+	axi = _mm512_setzero_ph();
+	bxi = _mm512_setzero_ph();
+	axi = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, ax + i));
+	bxi = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, bx + i));
+	dist = _mm512_fmadd_ph(axi, bxi, dist);
+
+	distance = (float)_mm512_reduce_add_ph(dist);
+
+	return distance;
+}
+
+TARGET_AVX512 static float
+HalfvecInnerProductAvx512Fp32(int dim, half * ax, half * bx)
 {
 	float		distance;
 	int			i;
@@ -202,6 +279,15 @@ HalfvecInnerProductAvx512Fp16(int dim, half * ax, half * bx)
 	distance = (float)_mm512_reduce_add_ps(dist);
 
 	return distance;
+}
+
+static float
+HalfvecInnerProductAvx512(int dim, half * ax, half * bx)
+{
+	if (halfvec_use_fp16_compute)
+		return HalfvecInnerProductAvx512Fp16(dim, ax, bx);
+	else
+		return HalfvecInnerProductAvx512Fp32(dim, ax, bx);
 }
 #endif
 #endif
@@ -279,8 +365,49 @@ HalfvecCosineSimilarityF16c(int dim, half * ax, half * bx)
 }
 
 #ifdef HAVE_AVX512FP16
-TARGET_AVX512 static double
+TARGET_AVX512FP16 static double
 HalfvecCosineSimilarityAvx512Fp16(int dim, half * ax, half * bx)
+{
+	float		similarity;
+	float		norma;
+	float		normb;
+	int			i;
+	int			count = (dim / 32) * 32;
+	unsigned long mask;
+	__m512h 	axi = _mm512_setzero_ph();
+	__m512h 	bxi = _mm512_setzero_ph();
+	__m512h		sim = _mm512_setzero_ph();
+	__m512h		na = _mm512_setzero_ph();
+	__m512h		nb = _mm512_setzero_ph();
+
+	for (i = 0; i < count; i += 32)
+	{
+		axi = _mm512_loadu_ph(ax+i);
+		bxi = _mm512_loadu_ph(bx+i);
+		sim = _mm512_fmadd_ph(axi, bxi, sim);
+		na = _mm512_fmadd_ph(axi, axi, na);
+		nb = _mm512_fmadd_ph(bxi, bxi, nb);
+	}
+
+	mask = (1 << (dim - i)) - 1;
+	axi = _mm512_setzero_ph();
+	bxi = _mm512_setzero_ph();
+	axi = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, ax + i));
+	bxi = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, bx + i));
+	sim = _mm512_fmadd_ph(axi, bxi, sim);
+	na = _mm512_fmadd_ph(axi, axi, na);
+	nb = _mm512_fmadd_ph(bxi, bxi, nb);
+
+	similarity = (float)_mm512_reduce_add_ph(sim);
+	norma = (float)_mm512_reduce_add_ph(na);
+	normb = (float)_mm512_reduce_add_ph(nb);
+
+	/* Use sqrt(a * b) over sqrt(a) * sqrt(b) */
+	return (double) similarity / sqrt((double) norma * (double) normb);
+}
+
+TARGET_AVX512 static double
+HalfvecCosineSimilarityAvx512Fp32(int dim, half * ax, half * bx)
 {
 	float		similarity;
 	float		norma;
@@ -324,6 +451,15 @@ HalfvecCosineSimilarityAvx512Fp16(int dim, half * ax, half * bx)
 
 	/* Use sqrt(a * b) over sqrt(a) * sqrt(b) */
 	return (double) similarity / sqrt((double) norma * (double) normb);
+}
+
+static double
+HalfvecCosineSimilarityAvx512(int dim, half * ax, half * bx)
+{
+	if (halfvec_use_fp16_compute)
+		return HalfvecCosineSimilarityAvx512Fp16(dim, ax, bx);
+	else
+		return HalfvecCosineSimilarityAvx512Fp32(dim, ax, bx);
 }
 #endif
 #endif
@@ -373,8 +509,38 @@ HalfvecL1DistanceF16c(int dim, half * ax, half * bx)
 }
 
 #ifdef HAVE_AVX512FP16
-TARGET_AVX512 static float
+TARGET_AVX512FP16 static float
 HalfvecL1DistanceAvx512Fp16(int dim, half * ax, half * bx)
+{
+	float		distance;
+	int			i;
+	int			count = (dim / 32) * 32;
+	unsigned long mask;
+	__m512h 	axi = _mm512_setzero_ph();
+	__m512h 	bxi = _mm512_setzero_ph();
+	__m512h		dist = _mm512_setzero_ph();
+
+	for (i = 0; i < count; i += 32)
+	{
+		axi = _mm512_loadu_ph(ax+i);
+		bxi = _mm512_loadu_ph(bx+i);
+		dist = _mm512_add_ph(dist, _mm512_abs_ph(_mm512_sub_ph(axi, bxi)));
+	}
+
+	mask = (1 << (dim - i)) - 1;
+	axi = _mm512_setzero_ph();
+	bxi = _mm512_setzero_ph();
+	axi = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, ax + i));
+	bxi = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, bx + i));
+	dist = _mm512_add_ph(dist, _mm512_abs_ph(_mm512_sub_ph(axi, bxi)));
+
+	distance = (float)_mm512_reduce_add_ph(dist);
+
+	return distance;
+}
+
+TARGET_AVX512 static float
+HalfvecL1DistanceAvx512Fp32(int dim, half * ax, half * bx)
 {
 	float		distance;
 	int			i;
@@ -407,6 +573,15 @@ HalfvecL1DistanceAvx512Fp16(int dim, half * ax, half * bx)
 	distance = (float)_mm512_reduce_add_ps(dist);
 
 	return distance;
+}
+
+static float
+HalfvecL1DistanceAvx512(int dim, half * ax, half * bx)
+{
+	if (halfvec_use_fp16_compute)
+		return HalfvecL1DistanceAvx512Fp16(dim, ax, bx);
+	else
+		return HalfvecL1DistanceAvx512Fp32(dim, ax, bx);
 }
 #endif
 #endif
@@ -527,11 +702,15 @@ HalfvecInit(void)
 #ifdef HAVE_AVX512FP16
     if (SupportsAvx512Fp16())
 	{
-		HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceAvx512Fp16;
-		HalfvecInnerProduct = HalfvecInnerProductAvx512Fp16;
-		HalfvecCosineSimilarity = HalfvecCosineSimilarityAvx512Fp16;
-		HalfvecL1Distance = HalfvecL1DistanceAvx512Fp16;
+		HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceAvx512;
+		HalfvecInnerProduct = HalfvecInnerProductAvx512;
+		HalfvecCosineSimilarity = HalfvecCosineSimilarityAvx512;
+		HalfvecL1Distance = HalfvecL1DistanceAvx512;
 	}
 #endif
 #endif
+
+	DefineCustomBoolVariable("halfvec.use_fp16_compute", "Use FP16 computation for distance calculations",
+							"If true, distance calculations are executed in FP16. If false, distance calculations are executed in FP32",
+							&halfvec_use_fp16_compute, false, PGC_USERSET, 0, NULL, NULL, NULL);
 }
