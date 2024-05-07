@@ -23,7 +23,7 @@
 #define TARGET_AVX512
 #else
 #define TARGET_F16C __attribute__((target("avx,f16c,fma")))
-#define TARGET_AVX512 __attribute__((target("avx512fp16,avx512f,avx512vl")))
+#define TARGET_AVX512 __attribute__((target("avx512fp16,avx512f,avx512vl,avx512bw")))
 #endif
 #endif
 
@@ -90,26 +90,35 @@ HalfvecL2SquaredDistanceAvx512Fp16(int dim, half * ax, half * bx)
 	float		distance;
 	int			i;
 	int			count = (dim / 16) * 16;
+	unsigned long mask;
+	__m256h     axi = _mm256_setzero_ph();
+	__m256h 	bxi = _mm256_setzero_ph();
+	__m512		axs = _mm512_setzero_ps();
+	__m512		bxs = _mm512_setzero_ps();
+	__m512		diff;
 	__m512 		dist = _mm512_setzero_ps();
 
 	for (i = 0; i < count; i += 16)
 	{
-		__m256h axi = _mm256_loadu_ph(ax+i);
-		__m256h bxi = _mm256_loadu_ph(bx+i);
-		__m512 axs = _mm512_cvtxph_ps(axi);
-		__m512 bxs = _mm512_cvtxph_ps(bxi);
-		__m512 diff = _mm512_sub_ps(axs, bxs);
+		axi = _mm256_loadu_ph(ax+i);
+		bxi = _mm256_loadu_ph(bx+i);
+		axs = _mm512_cvtxph_ps(axi);
+		bxs = _mm512_cvtxph_ps(bxi);
+		diff = _mm512_sub_ps(axs, bxs);
 		dist = _mm512_fmadd_ps(diff, diff, dist);
 	}
+	
+	mask = (1 << (dim - i)) - 1;
+	axi = _mm256_setzero_ph();
+	bxi = _mm256_setzero_ph();
+	axi = _mm256_castsi256_ph(_mm256_maskz_loadu_epi16(mask, ax + i));
+	bxi = _mm256_castsi256_ph(_mm256_maskz_loadu_epi16(mask, bx + i));
+	axs = _mm512_cvtxph_ps(axi);
+	bxs = _mm512_cvtxph_ps(bxi);
+	diff = _mm512_sub_ps(axs, bxs);
+	dist = _mm512_fmadd_ps(diff, diff, dist);
 
 	distance = (float)_mm512_reduce_add_ps(dist);
-
-	for (; i < dim; i++)
-	{
-		float       diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
-
-		distance += diff * diff;
-	}
 
 	return distance;
 }
@@ -165,21 +174,32 @@ HalfvecInnerProductAvx512Fp16(int dim, half * ax, half * bx)
 	float		distance;
 	int			i;
 	int			count = (dim / 16) * 16;
+	unsigned long mask;
+	__m256h     axi = _mm256_setzero_ph();
+	__m256h 	bxi = _mm256_setzero_ph();
+	__m512		axs = _mm512_setzero_ps();
+	__m512		bxs = _mm512_setzero_ps();
 	__m512		dist = _mm512_setzero_ps();
 
 	for (i = 0; i < count; i += 16)
 	{
-		__m256h axi = _mm256_loadu_ph(ax+i);
-		__m256h bxi = _mm256_loadu_ph(bx+i);
-		__m512 axs = _mm512_cvtxph_ps(axi);
-		__m512 bxs = _mm512_cvtxph_ps(bxi);
+		axi = _mm256_loadu_ph(ax+i);
+		bxi = _mm256_loadu_ph(bx+i);
+		axs = _mm512_cvtxph_ps(axi);
+		bxs = _mm512_cvtxph_ps(bxi);
 		dist = _mm512_fmadd_ps(axs, bxs, dist);
 	}
 
-	distance = (float)_mm512_reduce_add_ps(dist);
+	mask = (1 << (dim - i)) - 1;
+	axi = _mm256_setzero_ph();
+	bxi = _mm256_setzero_ph();
+	axi = _mm256_castsi256_ph(_mm256_maskz_loadu_epi16(mask, ax + i));
+	bxi = _mm256_castsi256_ph(_mm256_maskz_loadu_epi16(mask, bx + i));
+	axs = _mm512_cvtxph_ps(axi);
+	bxs = _mm512_cvtxph_ps(bxi);
+	dist = _mm512_fmadd_ps(axs, bxs, dist);
 
-	for (; i < dim; i++)
-		distance += HalfToFloat4(ax[i]) * HalfToFloat4(bx[i]);
+	distance = (float)_mm512_reduce_add_ps(dist);
 
 	return distance;
 }
@@ -267,35 +287,40 @@ HalfvecCosineSimilarityAvx512Fp16(int dim, half * ax, half * bx)
 	float		normb;
 	int			i;
 	int			count = (dim / 16) * 16;
+	unsigned long mask;
+	__m256h     axi = _mm256_setzero_ph();
+	__m256h 	bxi = _mm256_setzero_ph();
+	__m512		axs = _mm512_setzero_ps();
+	__m512		bxs = _mm512_setzero_ps();
 	__m512		sim = _mm512_setzero_ps();
 	__m512		na = _mm512_setzero_ps();
 	__m512		nb = _mm512_setzero_ps();
 
 	for (i = 0; i < count; i += 16)
 	{
-		__m256h axi = _mm256_loadu_ph(ax+i);
-		__m256h bxi = _mm256_loadu_ph(bx+i);
-		__m512 axs = _mm512_cvtxph_ps(axi);
-		__m512 bxs = _mm512_cvtxph_ps(bxi);
+		axi = _mm256_loadu_ph(ax+i);
+		bxi = _mm256_loadu_ph(bx+i);
+		axs = _mm512_cvtxph_ps(axi);
+		bxs = _mm512_cvtxph_ps(bxi);
 		sim = _mm512_fmadd_ps(axs, bxs, sim);
 		na = _mm512_fmadd_ps(axs, axs, na);
 		nb = _mm512_fmadd_ps(bxs, bxs, nb);
 	}
 
+	mask = (1 << (dim - i)) - 1;
+	axi = _mm256_setzero_ph();
+	bxi = _mm256_setzero_ph();
+	axi = _mm256_castsi256_ph(_mm256_maskz_loadu_epi16(mask, ax + i));
+	bxi = _mm256_castsi256_ph(_mm256_maskz_loadu_epi16(mask, bx + i));
+	axs = _mm512_cvtxph_ps(axi);
+	bxs = _mm512_cvtxph_ps(bxi);
+	sim = _mm512_fmadd_ps(axs, bxs, sim);
+	na = _mm512_fmadd_ps(axs, axs, na);
+	nb = _mm512_fmadd_ps(bxs, bxs, nb);
+
 	similarity = (float)_mm512_reduce_add_ps(sim);
 	norma = (float)_mm512_reduce_add_ps(na);
 	normb = (float)_mm512_reduce_add_ps(nb);
-
-	/* Auto-vectorized */
-	for (; i < dim; i++)
-	{
-		float		axi = HalfToFloat4(ax[i]);
-		float		bxi = HalfToFloat4(bx[i]);
-
-		similarity += axi * bxi;
-		norma += axi * axi;
-		normb += bxi * bxi;
-	}
 
 	/* Use sqrt(a * b) over sqrt(a) * sqrt(b) */
 	return (double) similarity / sqrt((double) norma * (double) normb);
@@ -354,21 +379,32 @@ HalfvecL1DistanceAvx512Fp16(int dim, half * ax, half * bx)
 	float		distance;
 	int			i;
 	int			count = (dim / 16) * 16;
+	unsigned long mask;
+	__m256h     axi = _mm256_setzero_ph();
+	__m256h 	bxi = _mm256_setzero_ph();
+	__m512		axs = _mm512_setzero_ps();
+	__m512		bxs = _mm512_setzero_ps();
 	__m512		dist = _mm512_setzero_ps();
 
 	for (i = 0; i < count; i += 16)
 	{
-		__m256h axi = _mm256_loadu_ph(ax+i);
-		__m256h bxi = _mm256_loadu_ph(bx+i);
-		__m512 axs = _mm512_cvtxph_ps(axi);
-		__m512 bxs = _mm512_cvtxph_ps(bxi);
+		axi = _mm256_loadu_ph(ax+i);
+		bxi = _mm256_loadu_ph(bx+i);
+		axs = _mm512_cvtxph_ps(axi);
+		bxs = _mm512_cvtxph_ps(bxi);
 		dist = _mm512_add_ps(dist, _mm512_abs_ps(_mm512_sub_ps(axs, bxs)));
 	}
 
-	distance = (float)_mm512_reduce_add_ps(dist);
+	mask = (1 << (dim - i)) - 1;
+	axi = _mm256_setzero_ph();
+	bxi = _mm256_setzero_ph();
+	axi = _mm256_castsi256_ph(_mm256_maskz_loadu_epi16(mask, ax + i));
+	bxi = _mm256_castsi256_ph(_mm256_maskz_loadu_epi16(mask, bx + i));
+	axs = _mm512_cvtxph_ps(axi);
+	bxs = _mm512_cvtxph_ps(bxi);
+	dist = _mm512_add_ps(dist, _mm512_abs_ps(_mm512_sub_ps(axs, bxs)));
 
-	for (; i < dim; i++)
-		distance += fabsf(HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]));
+	distance = (float)_mm512_reduce_add_ps(dist);
 
 	return distance;
 }
@@ -427,6 +463,7 @@ SupportsOsXsave()
 
 #define CPU_FEATURE_AVX512F         (1 << 16)
 #define CPU_FEATURE_AVX512_FP16     (1 << 23)
+#define CPU_FEATURE_AVX512_BW       (1 << 30)
 #define CPU_FEATURE_AVX512VL     	(1 << 31)
 
 TARGET_XSAVE static bool
@@ -454,6 +491,10 @@ SupportsAvx512Fp16()
 
 	/* Required by _mm256_loadu_ph */
     if ((exx[1] & CPU_FEATURE_AVX512VL) != CPU_FEATURE_AVX512VL)
+	    return false;
+
+	/* Required by masked loads in remainder loops */
+	if ((exx[1] & CPU_FEATURE_AVX512_BW) != CPU_FEATURE_AVX512_BW)
 		return false;
 
 	return (exx[3] & CPU_FEATURE_AVX512_FP16) == CPU_FEATURE_AVX512_FP16;
