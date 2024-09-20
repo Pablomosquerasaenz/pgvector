@@ -107,6 +107,7 @@
 /* Variables */
 extern int	hnsw_ef_search;
 extern int	hnsw_lock_tranche_id;
+extern bool hnsw_use_relaxed;
 
 typedef struct HnswElementData HnswElementData;
 typedef struct HnswNeighborArray HnswNeighborArray;
@@ -324,6 +325,12 @@ typedef struct HnswNeighborTupleData
 
 typedef HnswNeighborTupleData * HnswNeighborTuple;
 
+typedef struct HnswNextElement
+{
+	HnswCandidate *nextFromVisited,
+			   *nextFromSearch;
+}			HnswNextElement;
+
 typedef struct HnswScanOpaqueData
 {
 	const		HnswTypeInfo *typeInfo;
@@ -335,6 +342,14 @@ typedef struct HnswScanOpaqueData
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
+	char	   *base;
+	Datum		q;
+	int			m;
+	pairingheap *allVisited,
+			   *candidates;
+	void	   *visitedFlag;
+	bool		use_relaxed;
+	HnswNextElement next;
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -375,6 +390,8 @@ Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, Datum q, List *ep, int ef, int lc, Relation index, FmgrInfo *procinfo, Oid collation, int m, bool inserting, HnswElement skipElement);
+bool		HnswSearchLayerRelaxed(IndexScanDesc scan, List *ep, int ef);
+ItemPointerData NextScanItemsRelaxed(IndexScanDesc scan);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);

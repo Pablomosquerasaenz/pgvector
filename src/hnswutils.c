@@ -14,6 +14,9 @@
 #include "utils/datum.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
+#include "access/relscan.h"
+#include "vector.h"
 
 #if PG_VERSION_NUM < 170000
 static inline uint64
@@ -1406,3 +1409,294 @@ hnsw_sparsevec_support(PG_FUNCTION_ARGS)
 
 	PG_RETURN_POINTER(&typeInfo);
 };
+
+/*
+ * Algorithm 2 from paper with adoptation from Relaxed monotonicity
+ */
+static HnswCandidate *
+HnswSearchLayerRelaxedNext(char *base, Datum q, Relation index,
+						   FmgrInfo *procinfo, Oid collation, int m,
+						   pairingheap *C, visited_hash * v)
+{
+	HnswNeighborArray *neighborhoodData = NULL;
+	Size		neighborhoodSize;
+	HnswCandidate *c = NULL;
+
+	/* Create local memory for neighborhood if needed */
+	if (index == NULL)
+	{
+		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(HnswGetLayerM(m, 0));
+		neighborhoodData = palloc(neighborhoodSize);
+	}
+
+
+	if (!pairingheap_is_empty(C))
+	{
+		HnswNeighborArray *neighborhood;
+		HnswElement cElement;
+
+		c = HnswGetPairingHeapCandidate(c_node, pairingheap_remove_first(C));
+
+		cElement = HnswPtrAccess(base, c->element);
+
+		if (HnswPtrIsNull(base, cElement->neighbors))
+			HnswLoadNeighbors(cElement, index, m);
+
+		/* Get the neighborhood at layer lc */
+		neighborhood = HnswGetNeighbors(base, cElement, 0);
+
+		/* Copy neighborhood to local memory if needed */
+		if (index == NULL)
+		{
+			LWLockAcquire(&cElement->lock, LW_SHARED);
+			memcpy(neighborhoodData, neighborhood, neighborhoodSize);
+			LWLockRelease(&cElement->lock);
+			neighborhood = neighborhoodData;
+		}
+
+		for (int i = 0; i < neighborhood->length; i++)
+		{
+			HnswCandidate *e = &neighborhood->items[i];
+			bool		visited;
+
+			AddToVisited(base, v, e->element, index, &visited);
+
+			if (!visited)
+			{
+				float		eDistance;
+				HnswElement eElement = HnswPtrAccess(base, e->element);
+				HnswCandidate *ec;
+
+				if (index == NULL)
+					eDistance = GetElementDistance(base, e->element.ptr , q, procinfo, collation) ;
+				else
+					HnswLoadElement(eElement, &eDistance, &q, index, procinfo, collation, false, NULL);
+
+				Assert(!eElement->deleted);
+				ec = palloc(sizeof(HnswCandidate));
+
+				HnswPtrStore(base, ec->element, eElement);
+				ec->distance = eDistance;
+
+				pairingheap_add(C, &(CreatePairingHeapNode(ec)->c_node));
+			}
+		}
+	}
+	return c;
+}
+
+static HnswCandidate *
+HnswVisitedRelaxedNext(char *base, pairingheap *all_visited)
+{
+	while (!pairingheap_is_empty(all_visited))
+	{
+		HnswCandidate *candidate = HnswGetPairingHeapCandidate(c_node,  pairingheap_remove_first(all_visited));
+		HnswElement element = HnswPtrAccess(base, candidate->element);
+
+		if (element->heaptidsLength > 0)
+		{
+			return candidate;
+		}
+	}
+	return NULL;
+}
+
+
+/*
+ * Algorithm 2 from paper with adoptation from Relaxed monotonicity
+ */
+bool
+HnswSearchLayerRelaxed(IndexScanDesc scan, List *ep, int ef)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	Relation	index = scan->indexRelation;
+	FmgrInfo   *procinfo = so->procinfo;
+	Oid			collation = so->collation;
+	char	   *base = so->base;
+	Datum		q = so->q;
+	int			m = so->m;
+	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
+	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
+	pairingheap *all_visited = pairingheap_allocate(CompareNearestCandidates, NULL);
+	int			wlen = 0;
+	visited_hash *v = (visited_hash *) palloc(sizeof(visited_hash));
+	ListCell   *lc2;
+	HnswNeighborArray *neighborhoodData = NULL;
+	Size		neighborhoodSize;
+
+	InitVisited(base, v, index, ef, m);
+
+	/* Create local memory for neighborhood if needed */
+	if (index == NULL)
+	{
+		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(HnswGetLayerM(m, 0));
+		neighborhoodData = palloc(neighborhoodSize);
+	}
+
+	/* Add entry points to v, C, and W */
+	foreach(lc2, ep)
+	{
+		HnswCandidate *hc = (HnswCandidate *) lfirst(lc2);
+		bool		found;
+
+		AddToVisited(base, v, hc->element, index, &found);
+
+		pairingheap_add(C, &(CreatePairingHeapNode(hc)->c_node));
+		pairingheap_add(W, &(CreatePairingHeapNode(hc)->w_node));
+		wlen++;
+	}
+
+	while (!pairingheap_is_empty(C))
+	{
+		HnswNeighborArray *neighborhood;
+		HnswCandidate *c = HnswGetPairingHeapCandidate(c_node, pairingheap_remove_first(C));
+		HnswCandidate *f = HnswGetPairingHeapCandidate(w_node, pairingheap_first(W));
+		HnswElement cElement;
+
+		cElement = HnswPtrAccess(base, c->element);
+
+		if (HnswPtrIsNull(base, cElement->neighbors))
+			HnswLoadNeighbors(cElement, index, m);
+
+		/* Get the neighborhood at layer 0 */
+		neighborhood = HnswGetNeighbors(base, cElement, 0);
+
+		/* Copy neighborhood to local memory if needed */
+		if (index == NULL)
+		{
+			LWLockAcquire(&cElement->lock, LW_SHARED);
+			memcpy(neighborhoodData, neighborhood, neighborhoodSize);
+			LWLockRelease(&cElement->lock);
+			neighborhood = neighborhoodData;
+		}
+
+		for (int i = 0; i < neighborhood->length; i++)
+		{
+			HnswCandidate *e = &neighborhood->items[i];
+			bool		visited;
+
+			AddToVisited(base, v, e->element, index, &visited);
+
+			if (!visited)
+			{
+				float		eDistance;
+				HnswElement eElement = HnswPtrAccess(base, e->element);
+				HnswCandidate *ec;
+
+				if (index == NULL)
+					eDistance = GetElementDistance(base, e->element.ptr , q, procinfo, collation);
+				else
+					HnswLoadElement(eElement, &eDistance, &q, index, procinfo, collation, false, NULL);
+
+				Assert(!eElement->deleted);
+				ec = palloc(sizeof(HnswCandidate));
+
+				HnswPtrStore(base, ec->element, eElement);
+				ec->distance = eDistance;
+
+				pairingheap_add(C, &(CreatePairingHeapNode(ec)->c_node));
+			}
+		}
+		pairingheap_add(all_visited, &(CreatePairingHeapNode(c)->c_node));
+
+/*
+ * Check the condition to exit the loop:
+ * 1) the best candidates queue (W) is full
+ * 2) the current candidate (c) distance is further than the furthest in W
+ * 3) the next candidate from candidate set (C) is further than the furthest in W or candidate set (C) is empty
+ */
+		if ((wlen == ef) &&
+			f->distance < c->distance &&
+			(pairingheap_is_empty(C) ||
+			 (f->distance < HnswGetPairingHeapCandidate(c_node, pairingheap_first(C))->distance)
+			 )
+			)
+		{
+			break;
+		}
+		if (wlen == ef)
+		{
+			HnswGetPairingHeapCandidate(w_node, pairingheap_remove_first(W));
+			wlen--;
+		}
+		pairingheap_add(W, &(CreatePairingHeapNode(c)->w_node));
+		wlen++;
+	}
+	/* save all variables stored search state */
+	so->next.nextFromSearch = HnswSearchLayerRelaxedNext(base, q, index, procinfo, collation, m, C, (visited_hash *) v);
+	so->next.nextFromVisited = HnswVisitedRelaxedNext(base, all_visited);
+	so->visitedFlag = v;
+	so->candidates = C;
+	so->allVisited = all_visited;
+	return true;
+}
+
+
+ItemPointerData
+NextScanItemsRelaxed(IndexScanDesc scan)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	char	   *base = so->base;
+	Datum		q = so->q;
+	Relation	index = scan->indexRelation;
+	FmgrInfo   *procinfo = so->procinfo;
+	Oid			collation = so->collation;
+	int			m = so->m;
+	pairingheap *C = so->candidates;
+	void	   *v = so->visitedFlag;
+	pairingheap *all_visited = so->allVisited;
+	HnswNextElement *next = &so->next;
+
+	ItemPointerData heaptid;
+
+	if (next->nextFromVisited && next->nextFromSearch)
+	{
+		if (next->nextFromVisited->distance < next->nextFromSearch->distance)
+		{
+			HnswElement element = HnswPtrAccess(base, next->nextFromVisited->element);
+
+			heaptid = element->heaptids[--element->heaptidsLength];
+			if (element->heaptidsLength == 0)
+			{
+				next->nextFromVisited = HnswVisitedRelaxedNext(base, all_visited);
+			}
+		}
+		else
+		{
+			HnswElement element = HnswPtrAccess(base, next->nextFromSearch->element);
+
+			heaptid = element->heaptids[--element->heaptidsLength];
+			if (element->heaptidsLength == 0)
+			{
+				next->nextFromSearch = HnswSearchLayerRelaxedNext(base, q, index, procinfo, collation, m, C, (visited_hash *) v);
+			}
+		}
+	}
+	else if (next->nextFromVisited)
+	{
+		HnswElement element = HnswPtrAccess(base, next->nextFromVisited->element);
+
+		heaptid = element->heaptids[--element->heaptidsLength];
+		if (element->heaptidsLength == 0)
+		{
+			next->nextFromVisited = HnswVisitedRelaxedNext(base, all_visited);
+		}
+	}
+	else if (next->nextFromSearch)
+	{
+		HnswElement element = HnswPtrAccess(base, next->nextFromSearch->element);
+
+		heaptid = element->heaptids[--element->heaptidsLength];
+		if (element->heaptidsLength == 0)
+		{
+			next->nextFromSearch = HnswSearchLayerRelaxedNext(base, q, index, procinfo, collation, m, C, (visited_hash *) v);
+		}
+	}
+	else
+	{
+		/* tid with ip_posid==0 is invalid */
+		ItemPointerSet(&heaptid, InvalidBlockNumber, 0);
+	}
+
+	return heaptid;
+}
