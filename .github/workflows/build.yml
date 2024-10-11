@@ -10,6 +10,7 @@ jobs:
         include:
           - postgres: 18
             os: ubuntu-24.04
+
     steps:
       - uses: actions/checkout@v4
       - uses: ankane/setup-postgres@v1
