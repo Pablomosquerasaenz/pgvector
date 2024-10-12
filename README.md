@@ -451,6 +451,89 @@ Use [partitioning](https://www.postgresql.org/docs/current/ddl-partitioning.html
 CREATE TABLE items (embedding vector(3), category_id int) PARTITION BY LIST(category_id);
 ```
 
+## Iterative Search
+
+*Unreleased*
+
+With approximate indexes, queries with filtering can return less results due to post-filtering.
+
+Starting with 0.8.0, you can enable iterative search. If too few results from the initial index scan match the filters, the scan will resume until enough results are found (or it reaches `work_mem`). This can significantly improve recall (at the cost of speed).
+
+There are two modes for iterative search: strict and relaxed.
+
+Strict ensures results are in the exact order.
+
+```sql
+SET hnsw.iterative_search = strict_order;
+```
+
+Relaxed allows results to be slightly out of order by distance, but provides better recall.
+
+```sql
+SET hnsw.iterative_search = relaxed_order;
+```
+
+Note: IVFFlat only supports relaxed ordering for iterative search
+
+With relaxed ordering, you can use a [materialized CTE](https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CTE-MATERIALIZATION) to get strict ordering.
+
+```sql
+WITH relaxed_results AS MATERIALIZED (
+    SELECT id, embedding <-> '[1,2,3]' AS distance FROM items WHERE category_id = 123 ORDER BY distance LIMIT 5
+) SELECT * FROM relaxed_results ORDER BY distance;
+```
+
+For queries that filter by distance, use a materialized CTE and place the filter outside of it for best performance (due to the [current behavior](https://www.postgresql.org/message-id/flat/CAOdR5yGUoMQ6j7M5hNUXrySzaqZVGf_Ne%2B8fwZMRKTFxU1nbJg%40mail.gmail.com) of the Postgres executor)
+
+```sql
+WITH filtered_results AS MATERIALIZED (
+    SELECT id, embedding <-> '[1,2,3]' AS distance FROM items WHERE category_id = 123 ORDER BY distance LIMIT 5
+) SELECT * FROM filtered_results WHERE distance < 0.1 ORDER BY distance;
+```
+
+### Iterative Options
+
+Since scanning a large portion of an approximate index is expensive, there are options to control when the scan ends.
+
+#### HNSW
+
+Specify the max number of tuples visited
+
+```sql
+SET hnsw.max_search_tuples = 10000;
+```
+
+Note: This is approximate and does not apply to the initial scan
+
+The scan will also end if reaches `work_mem`. You can see when this happens by enabling debug messages.
+
+```sql
+SET client_min_messages = debug1;
+```
+
+which will print
+
+```text
+DEBUG:  hnsw index scan exceeded work_mem after 20000 tuples
+HINT:  Increase work_mem to scan more tuples.
+```
+
+You can adjust this if the server has enough memory
+
+```sql
+SET work_mem = '8MB';
+```
+
+#### IVFFlat
+
+Specify the max number of probes
+
+```sql
+SET ivfflat.max_probes = 100;
+```
+
+Note: If this is lower than `ivfflat.probes`, `ivfflat.probes` will be used
+
 ## Half-Precision Vectors
 
 *Added in 0.7.0*
